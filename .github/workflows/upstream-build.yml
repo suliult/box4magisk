@@ -1,0 +1,101 @@
+name: upstream-build
+
+# 上游 CHIZI-0618/box4magisk 有新提交时自动构建 Magisk 模块包并发布到本仓库 Releases
+# 产物 tag 形如 up-6ff4307（上游 commit 短 SHA），已存在则跳过
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"      # 每 6 小时检查一次
+  workflow_dispatch:            # 手动触发（首次验证用）
+  push:
+    branches: [main]
+    paths: [".github/workflows/upstream-build.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream commit
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/CHIZI-0618/box4magisk.git
+          git fetch --depth 1 upstream main
+          SHA=$(git rev-parse upstream/main)
+          SHORT=$(git rev-parse --short upstream/main)
+          SUBJ=$(git log -1 --format='%s' upstream/main)
+          echo "sha=$SHA"       >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT"   >> "$GITHUB_OUTPUT"
+          echo "subject=$SUBJ"  >> "$GITHUB_OUTPUT"
+          echo "上游 HEAD: $SHORT — $SUBJ"
+          if gh release view "up-$SHORT" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "已存在 up-$SHORT 的构建，跳过"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream tree
+        if: steps.up.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          git checkout --detach "${{ steps.up.outputs.sha }}"
+
+      - name: Setup Node.js
+        if: steps.up.outputs.exists == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        if: steps.up.outputs.exists == 'false'
+        working-directory: webui
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Package module
+        if: steps.up.outputs.exists == 'false'
+        id: pkg
+        run: |
+          set -euo pipefail
+          sh build.sh
+          ZIP=$(ls -1 box4_*.zip | head -1)
+          VER=$(grep -m1 '^version=' module.prop | cut -d= -f2)
+          echo "zip=$ZIP"     >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          unzip -t "$ZIP" >/dev/null
+          echo "产物: $ZIP (版本 $VER), $(du -h "$ZIP" | cut -f1), $(unzip -l "$ZIP" | tail -1 | awk '{print $2}') 个文件"
+
+      - name: Publish release
+        if: steps.up.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="up-${{ steps.up.outputs.short }}"
+          gh release create "$TAG" "${{ steps.pkg.outputs.zip }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "box4magisk ${{ steps.pkg.outputs.version }} (${{ steps.up.outputs.short }})" \
+            --notes "上游提交：${{ steps.up.outputs.short }}
+          \`${{ steps.up.outputs.subject }}\`
+
+          模块版本：${{ steps.pkg.outputs.version }}
+          上游仓库：https://github.com/CHIZI-0618/box4magisk
+          自动化来源：suliult/box4magisk upstream-build workflow"
